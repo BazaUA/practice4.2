@@ -1,34 +1,37 @@
 package com.google.devrel.training.conference.spi;
+import static com.google.devrel.training.conference.service.OfyService.factory;
+import static com.google.devrel.training.conference.service.OfyService.ofy;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
 import javax.inject.Named;
 
+import com.google.api.server.spi.config.Api;
+import com.google.api.server.spi.config.ApiMethod;
+import com.google.api.server.spi.config.ApiMethod.HttpMethod;
 import com.google.api.server.spi.response.ConflictException;
 import com.google.api.server.spi.response.ForbiddenException;
 import com.google.api.server.spi.response.NotFoundException;
 import com.google.api.server.spi.response.UnauthorizedException;
-
-import com.google.devrel.training.conference.form.ConferenceQueryForm;
-import com.googlecode.objectify.Work;
-import com.googlecode.objectify.cmd.Query;
-import static com.google.devrel.training.conference.service.OfyService.factory;
-import static com.google.devrel.training.conference.service.OfyService.ofy;
-
-import com.google.api.server.spi.config.Api;
-import com.google.api.server.spi.config.ApiMethod;
-import com.google.api.server.spi.config.ApiMethod.HttpMethod;
-import com.google.api.server.spi.response.UnauthorizedException;
+import com.google.appengine.api.memcache.MemcacheService;
+import com.google.appengine.api.memcache.MemcacheServiceFactory;
+import com.google.appengine.api.taskqueue.Queue;
+import com.google.appengine.api.taskqueue.QueueFactory;
+import com.google.appengine.api.taskqueue.TaskOptions;
 import com.google.appengine.api.users.User;
 import com.google.devrel.training.conference.Constants;
+import com.google.devrel.training.conference.domain.Announcement;
 import com.google.devrel.training.conference.domain.Conference;
 import com.google.devrel.training.conference.domain.Profile;
 import com.google.devrel.training.conference.form.ConferenceForm;
+import com.google.devrel.training.conference.form.ConferenceQueryForm;
 import com.google.devrel.training.conference.form.ProfileForm;
 import com.google.devrel.training.conference.form.ProfileForm.TeeShirtSize;
 import com.googlecode.objectify.Key;
-
+import com.googlecode.objectify.Work;
+import com.googlecode.objectify.cmd.Query;
 /**
  * Defines conference APIs.
  */
@@ -182,61 +185,33 @@ public class ConferenceApi {
         if (user == null) {
             throw new UnauthorizedException("Authorization required");
         }
-
-        // TODO (Lesson 4)
-        // Get the userId of the logged in User
-        String userId =user.getUserId();
-
-                // TODO (Lesson 4)
-                // Get the key for the User's Profile
-                Key<Profile> profileKey =Key.create(Profile.class,userId);
-
-
-        // TODO (Lesson 4)
-        // Allocate a key for the conference -- let App Engine allocate the ID
-        // Don't forget to include the parent Profile in the allocated ID
-        final Key<Conference> conferenceKey =factory().allocateId(profileKey,Conference.class);
-
-
-        // TODO (Lesson 4)
-        // Get the Conference Id from the Key
+        // Allocate Id first, in order to make the transaction idempotent.
+        final String userId = user.getUserId();
+        Key<Profile> profileKey = Key.create(Profile.class, userId);
+        final Key<Conference> conferenceKey = factory().allocateId(profileKey, Conference.class);
         final long conferenceId = conferenceKey.getId();
+        final Queue queue = QueueFactory.getDefaultQueue();
 
-                // TODO (Lesson 4)
-                // Get the existing Profile entity for the current user if there is one
-                // Otherwise create a new Profile entity with default values
+        // Start a transaction.
+        Conference conference = ofy().transact(new Work<Conference>() {
+            @Override
+            public Conference run() {
+                // Fetch user's Profile.
                 Profile profile = getProfileFromUser(user);
-
-
-                // TODO (Lesson 4)
-                // Create a new Conference Entity, specifying the user's Profile entity
-                // as the parent of the conference
-                Conference conference = new Conference(conferenceId,userId,conferenceForm);
-
-        // TODO (Lesson 4)
-        // Save Conference and Profile Entities
-        ofy().save().entities(conference,profile).now();
-
+                Conference conference = new Conference(conferenceId, userId, conferenceForm);
+                // Save Conference and Profile.
+                ofy().save().entities(conference, profile).now();
+                queue.add(ofy().getTransaction(),
+                        TaskOptions.Builder.withUrl("/tasks/send_confirmation_email")
+                                .param("email", profile.getMainEmail())
+                                .param("conferenceInfo", conference.toString()));
+                return conference;
+            }
+        });
         return conference;
     }
 
-    @ApiMethod(
-            name = "queryConferences",
-            path = "queryConferences",
-            httpMethod = HttpMethod.POST
-    )
-    public List queryConferences(ConferenceQueryForm conferenceQueryForm) {
-        Iterable<Conference> conferenceIterable = conferenceQueryForm.getQuery();
-        List<Conference> result = new ArrayList<>(0);
-        List<Key<Profile>> organizersKeyList = new ArrayList<>(0);
-        for (Conference conference : conferenceIterable) {
-            organizersKeyList.add(Key.create(Profile.class, conference.getOrganizerUserId()));
-            result.add(conference);
-        }
-// To avoid separate datastore gets for each Conference, pre-fetch the Profiles.
-        ofy().load().keys(organizersKeyList);
-        return result;
-    }
+
 
 
     @ApiMethod(name = "getConferencesCreated", path = "getConferencesCreated", httpMethod = HttpMethod.POST)
@@ -533,6 +508,46 @@ public class ConferenceApi {
                 throw new ForbiddenException("Unknown exception");
             }
         }
+        return result;
+    }
+
+    @ApiMethod(name = "getAnnouncement", path = "announcement", httpMethod = HttpMethod.GET)
+    public Announcement getAnnouncement(){
+        MemcacheService  memcacheService = MemcacheServiceFactory.getMemcacheService();
+        String announcementKey= Constants.MEMCACHE_ANNOUNCEMENTS_KEY;
+        Object message= memcacheService.get(announcementKey);
+        if(message!=null)
+            return new Announcement(message.toString());
+        return null;
+
+    }
+    @ApiMethod(
+            name = "queryConferences_nofilters",
+            path = "queryConferences_nofilters",
+            httpMethod = HttpMethod.POST
+    )
+    public List<Conference> queryConferences_nofilters() {
+        // Find all entities of type Conference
+        Query<Conference> query = ofy().load().type(Conference.class).order("name");
+
+        return query.list();
+    }
+
+    @ApiMethod(
+            name = "queryConferences",
+            path = "queryConferences",
+            httpMethod = HttpMethod.POST
+    )
+    public List<Conference> queryConferences(ConferenceQueryForm conferenceQueryForm) {
+        Iterable<Conference> conferenceIterable = conferenceQueryForm.getQuery();
+        List<Conference> result = new ArrayList<>(0);
+        List<Key<Profile>> organizersKeyList = new ArrayList<>(0);
+        for (Conference conference : conferenceIterable) {
+            organizersKeyList.add(Key.create(Profile.class, conference.getOrganizerUserId()));
+            result.add(conference);
+        }
+        // To avoid separate datastore gets for each Conference, pre-fetch the Profiles.
+        ofy().load().keys(organizersKeyList);
         return result;
     }
 }
